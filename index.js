@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const { Pool } = require('pg');
+const mysql = require('mysql2/promise');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -10,8 +10,9 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
+// CORS configuration - allow all origins
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175', 'http://localhost:3000', 'http://localhost:5175'],
+  origin: true,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -19,61 +20,82 @@ app.use(cors({
 
 app.use(express.json());
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+// MySQL connection pool
+const pool = mysql.createPool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'taskmanagement',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 });
 
+// Test database connection
 async function testConnection() {
   try {
-    const client = await pool.connect();
-    console.log('✅ Supabase PostgreSQL connected successfully');
-    client.release();
+    const connection = await pool.getConnection();
+    console.log('✅ MySQL connected successfully');
+    connection.release();
     return true;
   } catch (error) {
-    console.error('❌ Supabase connection failed:', error.message);
+    console.error('❌ MySQL connection failed:', error.message);
     return false;
   }
 }
 
+// Initialize database schema
 async function initializeDatabase() {
   try {
+    // Create database if not exists
+    const tempPool = mysql.createPool({
+      host: process.env.DB_HOST || 'localhost',
+      user: process.env.DB_USER || 'root',
+      password: process.env.DB_PASSWORD || '',
+      waitForConnections: true,
+      connectionLimit: 10,
+    });
+
+    await tempPool.query(`CREATE DATABASE IF NOT EXISTS ${process.env.DB_NAME || 'taskmanagement'}`);
+    await tempPool.end();
+
+    // Create tables
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
+        id INT AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         email VARCHAR(255) UNIQUE NOT NULL,
         password VARCHAR(255),
         role VARCHAR(50) DEFAULT 'Member',
         status VARCHAR(50) DEFAULT 'Active',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS team_members (
-        id SERIAL PRIMARY KEY,
+        id INT AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         email VARCHAR(255) NOT NULL,
         role VARCHAR(50) DEFAULT 'Member',
         status VARCHAR(50) DEFAULT 'Active',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS tasks (
-        id SERIAL PRIMARY KEY,
+        id INT AUTO_INCREMENT PRIMARY KEY,
         title VARCHAR(255) NOT NULL,
         description TEXT,
-        assignee_id INTEGER,
+        assignee_id INT,
         priority VARCHAR(50) DEFAULT 'Medium',
         status VARCHAR(50) DEFAULT 'To Do',
-        due_date TIMESTAMP,
+        due_date DATETIME,
         tags TEXT,
-        created_by INTEGER,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_by INT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         FOREIGN KEY (assignee_id) REFERENCES team_members(id),
         FOREIGN KEY (created_by) REFERENCES users(id)
       )
@@ -81,75 +103,91 @@ async function initializeDatabase() {
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS activity_history (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER,
-        team_member_id INTEGER,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT,
+        team_member_id INT,
         action VARCHAR(255) NOT NULL,
         task_title VARCHAR(255),
         description TEXT,
-        action_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        action_date DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (team_member_id) REFERENCES team_members(id)
       )
     `);
 
+    // Add team_member_id column if it doesn't exist
+    try {
+      await pool.query('ALTER TABLE activity_history ADD COLUMN team_member_id INT');
+    } catch (e) {
+      // Column may already exist
+    }
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS notifications (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT,
         message TEXT NOT NULL,
         is_read BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users(id)
       )
     `);
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS task_comments (
-        id SERIAL PRIMARY KEY,
-        task_id INTEGER,
-        team_member_id INTEGER,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        task_id INT,
+        team_member_id INT,
         content TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
         FOREIGN KEY (team_member_id) REFERENCES team_members(id)
       )
     `);
 
+    // Add team_member_id column if it doesn't exist
+    try {
+      await pool.query('ALTER TABLE task_comments ADD COLUMN team_member_id INT');
+    } catch (e) {
+      // Column may already exist
+    }
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS task_attachments (
-        id SERIAL PRIMARY KEY,
-        task_id INTEGER,
-        user_id INTEGER,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        task_id INT,
+        user_id INT,
         filename VARCHAR(255) NOT NULL,
         filepath VARCHAR(500) NOT NULL,
-        filesize INTEGER,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        filesize INT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
         FOREIGN KEY (user_id) REFERENCES users(id)
       )
     `);
 
+    // Seed default user if not exists
     const adminEmail = process.env.ADMIN_EMAIL || 'admin@example.com';
     const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
     const adminName = process.env.ADMIN_NAME || 'Admin';
     const adminRole = process.env.ADMIN_ROLE || 'Manager';
 
-    const existingUsers = await pool.query('SELECT id FROM users WHERE email = $1', [adminEmail]);
-    if (existingUsers.rows.length === 0) {
+    const [existingUsers] = await pool.query('SELECT id FROM users WHERE email = ?', [adminEmail]);
+    if (existingUsers.length === 0) {
       const hashedPassword = bcrypt.hashSync(adminPassword, 10);
       await pool.query(
-        'INSERT INTO users (name, email, password, role, status) VALUES ($1, $2, $3, $4, $5)',
+        'INSERT INTO users (name, email, password, role, status) VALUES (?, ?, ?, ?, ?)',
         [adminName, adminEmail, hashedPassword, adminRole, 'Active']
       );
       console.log(`✅ Default user created: ${adminEmail} / ${adminPassword}`);
     }
 
-    console.log('✅ Supabase database initialized');
+    console.log('✅ MySQL database initialized');
   } catch (error) {
     console.error('❌ Database initialization failed:', error.message);
   }
 }
 
+// Email transporter
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
@@ -158,6 +196,7 @@ const transporter = nodemailer.createTransport({
   }
 });
 
+// Auth middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -181,13 +220,13 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
-    const users = await pool.query('SELECT id, name, email, password, role, status FROM users WHERE email = $1', [email]);
+    const [users] = await pool.query('SELECT id, name, email, password, role, status FROM users WHERE email = ?', [email]);
 
-    if (users.rows.length === 0) {
+    if (users.length === 0) {
       return res.status(401).json({ error: 'User not found' });
     }
 
-    const user = users.rows[0];
+    const user = users[0];
 
     if (!password) {
       return res.status(401).json({ error: 'Password required' });
@@ -198,8 +237,10 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    const teamMembers = await pool.query('SELECT id FROM team_members WHERE email = $1', [email]);
-    const teamMemberId = teamMembers.rows.length > 0 ? teamMembers.rows[0].id : null;
+    console.log('Email for team member lookup:', email);
+    const [teamMembers] = await pool.query('SELECT id FROM team_members WHERE email = ?', [email]);
+    console.log('Found team members:', teamMembers);
+    const teamMemberId = teamMembers.length > 0 ? teamMembers[0].id : null;
 
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role, teamMemberId },
@@ -227,46 +268,53 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/register', async (req, res) => {
   try {
+    console.log('Register request body:', req.body);
+    
     const { name, email, password, role = 'Member' } = req.body;
 
     if (!name || !email || !password) {
       return res.status(400).json({ error: 'Name, email, and password are required' });
     }
 
-    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+    const [existing] = await pool.query('SELECT id FROM users WHERE email = ?', [email]);
+    console.log('Existing user check:', existing);
     
-    if (existing.rows.length > 0) {
+    if (existing.length > 0) {
       return res.status(409).json({ error: 'Email already registered' });
     }
 
     const hashedPassword = bcrypt.hashSync(password, 10);
 
-    const result = await pool.query(
-      'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4) RETURNING id',
+    const [result] = await pool.query(
+      'INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)',
       [name, email, hashedPassword, role]
     );
 
     await pool.query(
-      'INSERT INTO team_members (name, email, role, status) VALUES ($1, $2, $3, $4)',
+      'INSERT INTO team_members (name, email, role, status) VALUES (?, ?, ?, ?)',
       [name, email, role, 'Active']
     );
 
-    res.status(201).json({ message: 'User created successfully', userId: result.rows[0].id });
+    console.log('User created:', result);
+    res.status(201).json({ message: 'User created successfully', userId: result.insertId });
   } catch (error) {
     console.error('Registration error:', error.message, error.code);
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ error: 'Email already registered' });
+    }
     res.status(500).json({ error: 'Registration failed: ' + error.message });
   }
 });
 
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
-    const users = await pool.query('SELECT id, name, email, role, status FROM users WHERE id = $1', [req.user.id]);
+    const [users] = await pool.query('SELECT id, name, email, role, status FROM users WHERE id = ?', [req.user.id]);
 
-    if (users.rows.length === 0) {
+    if (users.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const user = users.rows[0];
+    const user = users[0];
     res.json({
       id: user.id,
       name: user.name,
@@ -285,7 +333,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 
 app.get('/api/tasks', authenticateToken, async (req, res) => {
   try {
-    const tasks = await pool.query(`
+    const [tasks] = await pool.query(`
       SELECT t.*, tm.name as assignee_name, tm.email as assignee_email, u.name as creator_name
       FROM tasks t
       LEFT JOIN team_members tm ON t.assignee_id = tm.id
@@ -293,7 +341,7 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
       ORDER BY t.created_at DESC
     `);
 
-    const formattedTasks = tasks.rows.map(task => ({
+    const formattedTasks = tasks.map(task => ({
       id: task.id,
       title: task.title,
       description: task.description,
@@ -319,19 +367,19 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
 app.get('/api/tasks/:id', authenticateToken, async (req, res) => {
   try {
     const taskId = parseInt(req.params.id);
-    const tasks = await pool.query(`
+    const [tasks] = await pool.query(`
       SELECT t.*, tm.name as assignee_name, u.name as creator_name
       FROM tasks t
       LEFT JOIN team_members tm ON t.assignee_id = tm.id
       LEFT JOIN users u ON t.created_by = u.id
-      WHERE t.id = $1
+      WHERE t.id = ?
     `, [taskId]);
 
-    if (tasks.rows.length === 0) {
+    if (tasks.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
     }
 
-    const task = tasks.rows[0];
+    const task = tasks[0];
     res.json({
       id: task.id,
       title: task.title,
@@ -358,28 +406,28 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
 
     let formattedDueDate = null;
     if (dueDate) {
-      formattedDueDate = new Date(dueDate);
+      formattedDueDate = new Date(dueDate).toISOString().slice(0, 19).replace('T', ' ');
     }
 
-    const result = await pool.query(
+    const [result] = await pool.query(
       `INSERT INTO tasks (title, description, assignee_id, priority, status, due_date, tags, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [title, description, assigneeId || null, priority || 'Medium', status || 'To Do', formattedDueDate, tags || '', req.user.id]
     );
 
     if (assigneeId) {
       await pool.query(
-        'INSERT INTO activity_history (user_id, action, task_title, description) VALUES ($1, $2, $3, $4)',
+        'INSERT INTO activity_history (user_id, action, task_title, description) VALUES (?, ?, ?, ?)',
         [assigneeId, 'Created', title, `New task assigned: ${title}`]
       );
 
       await pool.query(
-        'INSERT INTO notifications (user_id, message) VALUES ($1, $2)',
+        'INSERT INTO notifications (user_id, message) VALUES (?, ?)',
         [assigneeId, `New task assigned: ${title}`]
       );
     }
 
-    res.status(201).json({ message: 'Task created successfully', taskId: result.rows[0].id });
+    res.status(201).json({ message: 'Task created successfully', taskId: result.insertId });
   } catch (error) {
     console.error('Create task error:', error);
     res.status(500).json({ error: 'Failed to create task' });
@@ -391,79 +439,93 @@ app.put('/api/tasks/:id', authenticateToken, async (req, res) => {
     const updates = req.body;
     const taskId = parseInt(req.params.id);
 
-    const oldTask = await pool.query('SELECT * FROM tasks WHERE id = $1', [taskId]);
-    if (oldTask.rows.length === 0) {
+    const [oldTask] = await pool.query('SELECT * FROM tasks WHERE id = ?', [taskId]);
+    if (oldTask.length === 0) {
       return res.status(404).json({ error: 'Task not found' });
     }
 
     const fields = [];
     const values = [];
-    let paramIndex = 1;
 
     if (updates.title !== undefined) {
-      fields.push(`title = $${paramIndex++}`);
+      fields.push('title = ?');
       values.push(updates.title);
     }
     if (updates.description !== undefined) {
-      fields.push(`description = $${paramIndex++}`);
+      fields.push('description = ?');
       values.push(updates.description);
     }
     if (updates.assigneeId !== undefined) {
-      fields.push(`assignee_id = $${paramIndex++}`);
+      fields.push('assignee_id = ?');
       values.push(updates.assigneeId || null);
     }
     if (updates.priority !== undefined) {
-      fields.push(`priority = $${paramIndex++}`);
+      fields.push('priority = ?');
       values.push(updates.priority);
     }
     if (updates.status !== undefined) {
-      fields.push(`status = $${paramIndex++}`);
+      fields.push('status = ?');
       values.push(updates.status);
     }
     if (updates.dueDate !== undefined) {
-      fields.push(`due_date = $${paramIndex++}`);
+      fields.push('due_date = ?');
       let formattedDate = null;
       if (updates.dueDate) {
         const dateObj = new Date(updates.dueDate);
         if (!isNaN(dateObj.getTime())) {
-          formattedDate = dateObj;
+          formattedDate = dateObj.toISOString().slice(0, 19).replace('T', ' ');
         }
       }
       values.push(formattedDate);
     }
     if (updates.tags !== undefined) {
-      fields.push(`tags = $${paramIndex++}`);
+      fields.push('tags = ?');
       values.push(Array.isArray(updates.tags) ? updates.tags.join(',') : updates.tags);
     }
 
     if (fields.length > 0) {
       values.push(taskId);
-      await pool.query(`UPDATE tasks SET ${fields.join(', ')} WHERE id = $${paramIndex}`, values);
+      try {
+        console.log('UPDATE SQL:', `UPDATE tasks SET ${fields.join(', ')} WHERE id = ?`);
+        console.log('Values:', values);
+        await pool.query(`UPDATE tasks SET ${fields.join(', ')} WHERE id = ?`, values);
+      } catch (err) {
+        console.error('Update error:', err);
+        throw err;
+      }
     }
 
-    if (updates.assigneeId && updates.assigneeId !== oldTask.rows[0].assignee_id) {
-      await pool.query(
-        'INSERT INTO notifications (user_id, message) VALUES ($1, $2)',
-        [updates.assigneeId, `New task assigned: ${oldTask.rows[0].title}`]
-      );
+    if (updates.assigneeId && updates.assigneeId !== oldTask[0].assignee_id) {
+      try {
+        await pool.query(
+          'INSERT INTO notifications (user_id, message) VALUES (?, ?)',
+          [updates.assigneeId, `New task assigned: ${oldTask[0].title}`]
+        );
+      } catch (e) {
+        console.error('Notification insert error:', e);
+      }
     }
 
-    const newStatus = updates.status || oldTask.rows[0].status;
-    if (oldTask.rows[0].status !== newStatus && updates.assigneeId) {
-      await pool.query(
-        'INSERT INTO activity_history (user_id, action, task_title, description) VALUES ($1, $2, $3, $4)',
-        [updates.assigneeId, 'Moved', oldTask.rows[0].title, `Task moved from ${oldTask.rows[0].status} to ${newStatus}`]
-      );
+    const newStatus = updates.status || oldTask[0].status;
+    if (oldTask[0].status !== newStatus && updates.assigneeId) {
+      try {
+        await pool.query(
+          'INSERT INTO activity_history (user_id, action, task_title, description) VALUES (?, ?, ?, ?)',
+          [updates.assigneeId, 'Moved', oldTask[0].title, `Task moved from ${oldTask[0].status} to ${newStatus}`]
+        );
+      } catch (e) {
+        console.error('Activity insert error:', e);
+      }
     }
 
-    const tasks = await pool.query(`
+    const [tasks] = await pool.query(`
       SELECT t.*, tm.name as assignee_name, u.name as creator_name
       FROM tasks t
       LEFT JOIN team_members tm ON t.assignee_id = tm.id
       LEFT JOIN users u ON t.created_by = u.id
-      WHERE t.id = $1
+      WHERE t.id = ?
     `, [taskId]);
-    const task = tasks.rows[0];
+    const task = tasks[0];
     res.json({
       message: 'Task updated successfully',
       task: {
@@ -490,7 +552,7 @@ app.put('/api/tasks/:id', authenticateToken, async (req, res) => {
 app.delete('/api/tasks/:id', authenticateToken, async (req, res) => {
   try {
     const taskId = parseInt(req.params.id);
-    await pool.query('DELETE FROM tasks WHERE id = $1', [taskId]);
+    await pool.query('DELETE FROM tasks WHERE id = ?', [taskId]);
     res.json({ message: 'Task deleted successfully' });
   } catch (error) {
     console.error('Delete task error:', error);
@@ -503,15 +565,17 @@ app.delete('/api/tasks/:id', authenticateToken, async (req, res) => {
 app.get('/api/tasks/:id/comments', authenticateToken, async (req, res) => {
   try {
     const taskId = parseInt(req.params.id);
-    const comments = await pool.query(`
+    console.log('Getting comments for task:', taskId);
+    const [comments] = await pool.query(`
       SELECT tc.id, tc.task_id, tc.team_member_id, tc.content, tc.created_at, tm.name as author_name
       FROM task_comments tc
       LEFT JOIN team_members tm ON tc.team_member_id = tm.id
-      WHERE tc.task_id = $1
+      WHERE tc.task_id = ?
       ORDER BY tc.created_at ASC
     `, [taskId]);
+    console.log('Comments found:', comments.length);
 
-    res.json(comments.rows.map(c => ({
+    res.json(comments.map(c => ({
       id: c.id,
       author: c.author_name || 'Unknown',
       authorInitials: c.author_name ? c.author_name.split(' ').map(n => n[0]).join('') : '?',
@@ -533,21 +597,49 @@ app.post('/api/tasks/:id/comments', authenticateToken, async (req, res) => {
 
     const taskId = parseInt(req.params.id);
     const memberId = teamMemberId || req.user.teamMemberId;
+    console.log('Adding comment - taskId:', taskId, 'memberId:', memberId, 'content:', content);
 
-    const result = await pool.query(
-      'INSERT INTO task_comments (task_id, team_member_id, content) VALUES ($1, $2, $3) RETURNING id, created_at',
+    const [result] = await pool.query(
+      'INSERT INTO task_comments (task_id, team_member_id, content) VALUES (?, ?, ?)',
       [taskId, memberId, content]
     );
+    console.log('Insert result:', result);
 
-    const teamMember = await pool.query('SELECT name FROM team_members WHERE id = $1', [memberId]);
-    const authorName = teamMember.rows.length > 0 ? teamMember.rows[0].name : 'Unknown';
+    if (!result.insertId) {
+      return res.status(201).json({
+        id: Date.now(),
+        author: 'You',
+        authorInitials: 'Y',
+        content: content,
+        time: new Date().toISOString(),
+      });
+    }
+
+    const [comments] = await pool.query(`
+      SELECT tc.id, tc.task_id, tc.team_member_id, tc.content, tc.created_at, tm.name as author_name
+      FROM task_comments tc
+      LEFT JOIN team_members tm ON tc.team_member_id = tm.id
+      WHERE tc.id = ?
+    `, [result.insertId]);
+    console.log('Inserted comment:', comments[0]);
+
+    const comment = comments[0];
+    if (!comment) {
+      return res.status(201).json({
+        id: result.insertId,
+        author: 'You',
+        authorInitials: 'Y',
+        content: content,
+        time: new Date().toISOString(),
+      });
+    }
 
     res.status(201).json({
-      id: result.rows[0].id,
-      author: authorName,
-      authorInitials: authorName.split(' ').map(n => n[0]).join(''),
-      content: content,
-      time: result.rows[0].created_at,
+      id: comment.id,
+      author: comment.author_name || 'Unknown',
+      authorInitials: comment.author_name ? comment.author_name.split(' ').map(n => n[0]).join('') : '?',
+      content: comment.content,
+      time: comment.created_at,
     });
   } catch (error) {
     console.error('Add comment error:', error);
@@ -559,15 +651,15 @@ app.post('/api/tasks/:id/comments', authenticateToken, async (req, res) => {
 
 app.get('/api/tasks/:id/attachments', authenticateToken, async (req, res) => {
   try {
-    const attachments = await pool.query(`
+    const [attachments] = await pool.query(`
       SELECT ta.*, u.name as uploader_name
       FROM task_attachments ta
       LEFT JOIN users u ON ta.user_id = u.id
-      WHERE ta.task_id = $1
+      WHERE ta.task_id = ?
       ORDER BY ta.created_at DESC
     `, [parseInt(req.params.id)]);
 
-    res.json(attachments.rows.map(a => ({
+    res.json(attachments.map(a => ({
       id: a.id,
       name: a.filename,
       size: a.filesize,
@@ -589,12 +681,12 @@ app.post('/api/tasks/:id/attachments', authenticateToken, async (req, res) => {
     }
 
     const taskId = parseInt(req.params.id);
-    const result = await pool.query(
-      'INSERT INTO task_attachments (task_id, user_id, filename, filepath, filesize) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+    const [result] = await pool.query(
+      'INSERT INTO task_attachments (task_id, user_id, filename, filepath, filesize) VALUES (?, ?, ?, ?, ?)',
       [taskId, req.user.id, filename, filepath, filesize || 0]
     );
 
-    res.status(201).json({ id: result.rows[0].id, message: 'Attachment added' });
+    res.status(201).json({ id: result.insertId, message: 'Attachment added' });
   } catch (error) {
     console.error('Add attachment error:', error);
     res.status(500).json({ error: 'Failed to add attachment' });
@@ -605,19 +697,19 @@ app.post('/api/tasks/:id/attachments', authenticateToken, async (req, res) => {
 
 app.get('/api/team-members', authenticateToken, async (req, res) => {
   try {
-    const members = await pool.query(`
+    const [members] = await pool.query(`
       SELECT tm.*, (SELECT COUNT(*) FROM tasks WHERE assignee_id = tm.id AND status != 'Done') as tasks_count
       FROM team_members tm
       ORDER BY tm.name
     `);
 
-    const formattedMembers = members.rows.map(member => ({
+    const formattedMembers = members.map(member => ({
       id: member.id,
       name: member.name,
       email: member.email,
       role: member.role,
       status: member.status,
-      tasksCount: parseInt(member.tasks_count),
+      tasksCount: member.tasks_count,
       initials: member.name.split(' ').map(n => n[0]).join('')
     }));
 
@@ -630,24 +722,24 @@ app.get('/api/team-members', authenticateToken, async (req, res) => {
 
 app.get('/api/team-members/:id', authenticateToken, async (req, res) => {
   try {
-    const members = await pool.query(`
+    const [members] = await pool.query(`
       SELECT tm.*, (SELECT COUNT(*) FROM tasks WHERE assignee_id = tm.id AND status != 'Done') as tasks_count
       FROM team_members tm
-      WHERE tm.id = $1
+      WHERE tm.id = ?
     `, [parseInt(req.params.id)]);
 
-    if (members.rows.length === 0) {
+    if (members.length === 0) {
       return res.status(404).json({ error: 'Team member not found' });
     }
 
-    const member = members.rows[0];
+    const member = members[0];
     res.json({
       id: member.id,
       name: member.name,
       email: member.email,
       role: member.role,
       status: member.status,
-      tasksCount: parseInt(member.tasks_count),
+      tasksCount: member.tasks_count,
       initials: member.name.split(' ').map(n => n[0]).join('')
     });
   } catch (error) {
@@ -664,12 +756,12 @@ app.post('/api/team-members', authenticateToken, async (req, res) => {
 
     const { name, email, role, password } = req.body;
 
-    const result = await pool.query('INSERT INTO team_members (name, email, role) VALUES ($1, $2, $3) RETURNING id', [name, email, role || 'Member']);
+    const [result] = await pool.query('INSERT INTO team_members (name, email, role) VALUES (?, ?, ?)', [name, email, role || 'Member']);
 
     const hashedPassword = bcrypt.hashSync(password || 'password123', 10);
-    await pool.query('INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4)', [name, email, hashedPassword, role || 'Member']);
+    await pool.query('INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)', [name, email, hashedPassword, role || 'Member']);
 
-    res.status(201).json({ message: 'Team member added successfully', memberId: result.rows[0].id });
+    res.status(201).json({ message: 'Team member added successfully', memberId: result.insertId });
   } catch (error) {
     console.error('Create team member error:', error);
     res.status(500).json({ error: 'Failed to add team member' });
@@ -684,7 +776,7 @@ app.put('/api/team-members/:id', authenticateToken, async (req, res) => {
 
     const { name, email, role, status } = req.body;
     const memberId = parseInt(req.params.id);
-    await pool.query('UPDATE team_members SET name = $1, email = $2, role = $3, status = $4 WHERE id = $5', [name, email, role, status, memberId]);
+    await pool.query('UPDATE team_members SET name = ?, email = ?, role = ?, status = ? WHERE id = ?', [name, email, role, status, memberId]);
 
     res.json({ message: 'Team member updated successfully' });
   } catch (error) {
@@ -700,7 +792,7 @@ app.delete('/api/team-members/:id', authenticateToken, async (req, res) => {
     }
 
     const memberId = parseInt(req.params.id);
-    await pool.query('DELETE FROM team_members WHERE id = $1', [memberId]);
+    await pool.query('DELETE FROM team_members WHERE id = ?', [memberId]);
     res.json({ message: 'Team member deleted successfully' });
   } catch (error) {
     console.error('Delete team member error:', error);
@@ -711,8 +803,8 @@ app.delete('/api/team-members/:id', authenticateToken, async (req, res) => {
 app.get('/api/team-members/:id/tasks', authenticateToken, async (req, res) => {
   try {
     const memberId = parseInt(req.params.id);
-    const tasks = await pool.query('SELECT * FROM tasks WHERE assignee_id = $1 ORDER BY created_at DESC', [memberId]);
-    res.json(tasks.rows.map(task => ({
+    const [tasks] = await pool.query('SELECT * FROM tasks WHERE assignee_id = ? ORDER BY created_at DESC', [memberId]);
+    res.json(tasks.map(task => ({
       id: task.id,
       title: task.title,
       description: task.description,
@@ -730,8 +822,10 @@ app.get('/api/team-members/:id/tasks', authenticateToken, async (req, res) => {
 app.get('/api/team-members/:id/activity', authenticateToken, async (req, res) => {
   try {
     const memberId = parseInt(req.params.id);
-    const activities = await pool.query('SELECT * FROM activity_history WHERE team_member_id = $1 ORDER BY action_date DESC LIMIT 20', [memberId]);
-    res.json(activities.rows.map(activity => ({
+    console.log('Getting activity for member:', memberId);
+    const [activities] = await pool.query('SELECT * FROM activity_history WHERE team_member_id = ? ORDER BY action_date DESC LIMIT 20', [memberId]);
+    console.log('Activities found:', activities.length);
+    res.json(activities.map(activity => ({
       id: activity.id,
       action: activity.action,
       task: activity.task_title,
@@ -748,8 +842,8 @@ app.get('/api/team-members/:id/activity', authenticateToken, async (req, res) =>
 
 app.get('/api/notifications', authenticateToken, async (req, res) => {
   try {
-    const notifications = await pool.query('SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [req.user.id]);
-    res.json(notifications.rows);
+    const [notifications] = await pool.query('SELECT * FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50', [req.user.id]);
+    res.json(notifications);
   } catch (error) {
     console.error('Get notifications error:', error);
     res.status(500).json({ error: 'Failed to get notifications' });
@@ -759,7 +853,7 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
 app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
   try {
     const notificationId = parseInt(req.params.id);
-    await pool.query('UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2', [notificationId, req.user.id]);
+    await pool.query('UPDATE notifications SET is_read = TRUE WHERE id = ? AND user_id = ?', [notificationId, req.user.id]);
     res.json({ message: 'Notification marked as read' });
   } catch (error) {
     console.error('Mark notification read error:', error);
@@ -796,7 +890,7 @@ app.post('/api/send-assignment-email', authenticateToken, async (req, res) => {
 
 app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
   try {
-    const taskStats = await pool.query(`
+    const [taskStats] = await pool.query(`
       SELECT 
         COUNT(*) as total_tasks,
         SUM(CASE WHEN status = 'To Do' THEN 1 ELSE 0 END) as todo_count,
@@ -807,33 +901,52 @@ app.get('/api/dashboard/stats', authenticateToken, async (req, res) => {
       FROM tasks
     `);
 
-    const memberStats = await pool.query(`
+    const [memberStats] = await pool.query(`
       SELECT COUNT(*) as total_members, SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) as active_count
       FROM team_members
     `);
 
+    const [weeklyTasks] = await pool.query(`
+      SELECT 
+        DAYOFWEEK(created_at) as day_of_week,
+        COUNT(*) as task_count
+      FROM tasks
+      WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+      GROUP BY DAYOFWEEK(created_at)
+    `);
+
+    const dayMap = {
+      1: 'Sun', 2: 'Mon', 3: 'Tue', 4: 'Wed', 5: 'Thu', 6: 'Fri', 7: 'Sat'
+    };
+
+    const taskCountByDay = { Mon: 0, Tue: 0, Wed: 0, Thu: 0, Fri: 0, Sat: 0, Sun: 0 };
+    weeklyTasks.forEach((row) => {
+      const dayName = dayMap[row.day_of_week];
+      if (dayName) taskCountByDay[dayName] = row.task_count;
+    });
+
     const workloadData = [
-      { name: 'Mon', tasks: Math.floor(Math.random() * 15) + 5 },
-      { name: 'Tue', tasks: Math.floor(Math.random() * 15) + 5 },
-      { name: 'Wed', tasks: Math.floor(Math.random() * 15) + 5 },
-      { name: 'Thu', tasks: Math.floor(Math.random() * 15) + 5 },
-      { name: 'Fri', tasks: Math.floor(Math.random() * 15) + 5 },
-      { name: 'Sat', tasks: Math.floor(Math.random() * 10) },
-      { name: 'Sun', tasks: Math.floor(Math.random() * 5) },
+      { name: 'Mon', tasks: taskCountByDay['Mon'] },
+      { name: 'Tue', tasks: taskCountByDay['Tue'] },
+      { name: 'Wed', tasks: taskCountByDay['Wed'] },
+      { name: 'Thu', tasks: taskCountByDay['Thu'] },
+      { name: 'Fri', tasks: taskCountByDay['Fri'] },
+      { name: 'Sat', tasks: taskCountByDay['Sat'] },
+      { name: 'Sun', tasks: taskCountByDay['Sun'] },
     ];
 
     const activityData = [
-      { name: 'Week 1', completed: taskStats.rows[0].done_count || 0 },
-      { name: 'Week 2', completed: Math.floor((taskStats.rows[0].done_count || 0) * 0.8) },
-      { name: 'Week 3', completed: Math.floor((taskStats.rows[0].done_count || 0) * 0.6) },
-      { name: 'Week 4', completed: Math.floor((taskStats.rows[0].done_count || 0) * 0.4) },
+      { name: 'Week 1', completed: taskStats[0].done_count || 0 },
+      { name: 'Week 2', completed: Math.floor((taskStats[0].done_count || 0) * 0.8) },
+      { name: 'Week 3', completed: Math.floor((taskStats[0].done_count || 0) * 0.6) },
+      { name: 'Week 4', completed: Math.floor((taskStats[0].done_count || 0) * 0.4) },
     ];
 
     res.json({
-      totalTasks: parseInt(taskStats.rows[0].total_tasks) || 0,
-      inProgress: parseInt(taskStats.rows[0].in_progress_count) || 0,
-      completed: parseInt(taskStats.rows[0].done_count) || 0,
-      overdue: parseInt(taskStats.rows[0].high_priority_count) || 0,
+      totalTasks: taskStats[0].total_tasks || 0,
+      inProgress: taskStats[0].in_progress_count || 0,
+      completed: taskStats[0].done_count || 0,
+      overdue: taskStats[0].high_priority_count || 0,
       totalTasksChange: '+12%',
       inProgressChange: '+8%',
       completedChange: '+15%',
@@ -857,7 +970,7 @@ async function startServer() {
       console.log(`📊 API endpoints available at http://localhost:${PORT}/api`);
     });
   } else {
-    console.log('❌ Please check your Supabase credentials in .env file');
+    console.log('❌ Please check your MySQL credentials in .env file');
   }
 }
 
